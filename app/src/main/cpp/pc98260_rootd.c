@@ -61,22 +61,22 @@ static const char *root_stop_file(void)
 }
 
 /*
- * 停止检测：节流 + 能力探测。
+ * Stop detection: throttling + capability probing.
  *
- * 真机 2026-11-04 证据（bugreport dmesg）：
+ * Real-device 2026-11-04 evidence (bugreport dmesg):
  *   avc:  denied { search } for comm="libcve98260.so" name="/"
  *         scontext=u:object_r:unlabeled:s0 tcontext=u:object_r:rootfs:s0
- * 每 200 ms 一条；auditd 补上下文去读 /proc/<pid> 又被拒 -> 正反馈，
- * audit_lost 每秒 +3（31652 -> 31686），审计积压长期打满。
+ * One every 200 ms; auditd supplements context to read /proc/<pid> and is denied too -> positive feedback,
+ * audit_lost +3 per second (31652 -> 31686), audit backlog stays saturated long-term.
  *
- * 根因：利用进程跑在 **unlabeled 域**（exec 的是 .so，没有域转换），
- * 对 "/" 的 search 被拒 -> 路径解析恒返回 EACCES -> stop 文件**根本读不到**，
- * 也就是说这条通道在本机型上是**死的**，却每 200 ms 贡献一条 AVC。
+ * Root cause: the exploit process runs in the **unlabeled domain** (exec of .so, no domain transition),
+ * search on "/" is denied -> path resolution always returns EACCES -> stop file **cannot be read at all**,
+ * meaning this channel is **dead** on this device model, yet contributes one AVC every 200 ms.
  *
- * 处理：
- *   1) 第一次 stat 若是 EACCES，认定该通道不可用，之后**不再 stat**；
- *   2) 可用时把检查频率从 200 ms 降到 2 s（停止延迟由 socket / SIGTERM 兜底，
- *      宿主 ROOTD_STOP 超时是 30 s，2 s 绰绰有余）。
+ * Handling:
+ *   1) On first stat returning EACCES, consider the channel unavailable and **never stat again**;
+ *   2) When usable, reduce check frequency from 200 ms to 2 s (stop delay covered by socket/SIGTERM,
+ *      host ROOTD_STOP timeout is 30 s, 2 s is more than enough).
  */
 static int stop_file_present(void)
 {
@@ -100,7 +100,7 @@ static int stop_file_present(void)
 		return 1;
 	}
 	if (errno == EACCES) {
-		/* unlabeled 域：这条路走不通，直接放弃该通道，别再制造 AVC。 */
+		/* unlabeled domain: this path doesn't work, abandon this channel, stop generating AVCs. */
 		usable = 0;
 		dprintf(STDERR_FILENO,
 			"[rootd] stop file unreachable (EACCES, unlabeled domain); "
@@ -254,18 +254,19 @@ static int read_exact(int fd, void *buffer, size_t length)
 }
 
 /*
- * S4 加固（2026-10-29）：rootd 以 uid=0 运行，原先对除 STOP 外的任意命令直接以
- * sh -c 执行。本次新增：执行前审计日志（命令 + uid）+ 可选精确命令白名单。
- * 彻底白名单化（仅允许固定脚本）会砍掉 `su` 这一核心功能（用户有意要 root shell），
- * 属产品级权衡，留待产品决策；本次仅做非破坏性加固，默认维持宽松行为。
+ * S4 hardening (2026-10-29): rootd runs as uid=0, previously any command except STOP
+ * was executed directly via sh -c. This change adds: audit logging before execution (command + uid)
+ * + optional exact command allowlist.
+ * Complete allowlisting (only fixed scripts allowed) would cut the `su` core function (user intentionally wants root shell),
+ * a product-level tradeoff left for product decision; this change only does non-destructive hardening, defaulting to permissive behavior.
  */
 static const char *const ROOTD_ALLOWLIST[] = {
-	/* 留空 = 维持现状（宽松）。要收紧攻击面时，把应用合法下发的命令原文逐条填入，
-	 * 即自动开启严格模式（sh -c 命令必须逐字命中其中之一）。 */
+	/* Empty = maintain status quo (permissive). To tighten the attack surface, fill in the exact command texts
+ * issued by the application one by one, which automatically enables strict mode (sh -c commands must match one of them verbatim). */
 };
 #define ROOTD_ALLOWLIST_N ((int)(sizeof(ROOTD_ALLOWLIST) / sizeof(ROOTD_ALLOWLIST[0])))
 
-/* 返回 1 表示允许；ROOTD_ALLOWLIST 为空时恒返回 1（不破坏既有行为）。 */
+/* Return 1 to allow; ROOTD_ALLOWLIST empty always returns 1 (does not break existing behavior). */
 static int rootd_command_allowed(const char *cmd)
 {
 	if (ROOTD_ALLOWLIST_N == 0)
@@ -291,11 +292,11 @@ static int handle_client(int fd)
 		dprintf(STDERR_FILENO, "[rootd] stop request received, shutting down\n");
 		return 1;
 	}
-	/* S4 审计：记录每次以 uid=0 下发的命令，便于取证与异常排查。 */
+	/* S4 audit: log every command issued as uid=0, for forensics and anomaly troubleshooting. */
 	dprintf(STDERR_FILENO, "[rootd] exec (uid=%u len=%u): %.*s\n",
 		(unsigned)getuid(), length, (int)length, command);
-	/* S4 可选白名单：仅当配置了精确白名单时，程序化 sh -c 命令须逐字命中；
-	 * 交互式 shell（length==0）是 su 功能，不受此限。默认未配置=放行。 */
+	/* S4 optional allowlist: only when exact allowlist is configured, programmatic sh -c commands must match verbatim;
+ * interactive shell (length==0) is su functionality, not subject to this limit. Default unset = allow. */
 	if (length && !rootd_command_allowed(command)) {
 		dprintf(STDERR_FILENO,
 			"[rootd] rejected: command not in allowlist (strict mode)\n");
